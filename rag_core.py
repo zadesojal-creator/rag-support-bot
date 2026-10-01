@@ -1,147 +1,119 @@
 """
-rag_core.py (Cloud Version)
----------------------------
-Uses Pinecone instead of ChromaDB for cloud deployment.
+rag_core.py
+-----------
+The RAG engine. Contains:
+  - build_vectorstore()  → Steps 1-4 (load, chunk, embed, store)
+  - load_vectorstore()   → Load existing Chroma DB
+  - answer_question()    → Steps 5-8 (embed query, search, prompt, LLM)
 """
 
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # Loads GROQ_API_KEY and PINECONE_API_KEY from .env
+load_dotenv()
 
-from pinecone import Pinecone, ServerlessSpec
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import TokenTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
+from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
-import time
 
-# ── CONFIG ──────────────────────────────────────────────
+# ---------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------
 KNOWLEDGE_DIR = "./knowledge"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "openai/gpt-oss-20b"          # Current free-tier default on Groq
-PINECONE_INDEX_NAME = "rag-knowledge-base"
-EMBEDDING_DIMENSION = 384                  # all-MiniLM-L6-v2 outputs 384-dim vectors
+CHROMA_DIR = "./chroma_db"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # 384-dim, tiny (~80 MB), CPU-friendly
+LLM_MODEL = "openai/gpt-oss-20b"     # Groq's fast Llama 3.1 8B
+CHUNK_SIZE = 300                       # tokens per chunk
+CHUNK_OVERLAP = 50                     # overlap to avoid cutting sentences
+TOP_K = 4                              # how many chunks to retrieve
 
+# Fail fast if the API key is missing
 if not os.getenv("GROQ_API_KEY"):
-    raise ValueError("GROQ_API_KEY not set. Add it to .env or Render environment variables.")
-if not os.getenv("PINECONE_API_KEY"):
-    raise ValueError("PINECONE_API_KEY not set. Add it to .env or Render environment variables.")
+    raise ValueError(
+        "GROQ_API_KEY is not set. Get one free at https://console.groq.com"
+    )
 
 
-# ── PINECONE INDEX MANAGEMENT ───────────────────────────
-def vectorstore_exists() -> bool:
-    """Return True only when the Pinecone index exists and contains vectors."""
-    try:
-        pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-        existing_indexes = [idx.name for idx in pc.list_indexes()]
-        if PINECONE_INDEX_NAME not in existing_indexes:
-            return False
-
-        index = pc.Index(PINECONE_INDEX_NAME)
-        stats = index.describe_index_stats()
-        return stats.get("total_vector_count", 0) > 0
-    except Exception as exc:
-        print(f"Warning: unable to check Pinecone index: {exc}")
-        return False
-
-
-def get_or_create_pinecone_index():
-    """Create the Pinecone index if it doesn't exist, then return it."""
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-
-    existing_indexes = [idx.name for idx in pc.list_indexes()]
-
-    if PINECONE_INDEX_NAME not in existing_indexes:
-        print(f"Creating Pinecone index '{PINECONE_INDEX_NAME}' ...")
-        try:
-            pc.create_index(
-                name=PINECONE_INDEX_NAME,
-                dimension=EMBEDDING_DIMENSION,
-                metric="cosine",
-                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-            )
-        except Exception as exc:
-            if "ALREADY_EXISTS" not in str(exc):
-                raise
-            print(f"Index '{PINECONE_INDEX_NAME}' already exists. Continuing.")
-
-        # Wait until the index is ready; fail gracefully if it is already ready.
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            try:
-                status = pc.describe_index(PINECONE_INDEX_NAME).status
-                if status.get("ready"):
-                    print("Index ready.")
-                    break
-            except Exception:
-                pass
-            time.sleep(1)
-        else:
-            print("Index creation timed out; continuing anyway.")
-    else:
-        print(f"Index '{PINECONE_INDEX_NAME}' already exists.")
-
-    return pc.Index(PINECONE_INDEX_NAME)
-
-
-def index_is_empty(pinecone_index) -> bool:
-    """Check if the Pinecone index has any vectors."""
-    stats = pinecone_index.describe_index_stats()
-    return stats.get("total_vector_count", 0) == 0
-
-
-# ── BUILD VECTOR STORE ──────────────────────────────────
+# ===============================================================
+# STEPS 1-4: LOAD → CHUNK → EMBED → STORE
+# ===============================================================
 def build_vectorstore():
-    """Load PDFs → chunk → embed → upload to Pinecone. Run ONCE."""
-    if vectorstore_exists():
-        print("Vector store already exists; loading it instead of rebuilding.")
-        return load_vectorstore()
+    """
+    Reads all PDFs in ./knowledge, chunks them, embeds them,
+    and stores them in a local ChromaDB.
+    Run this ONCE (or whenever your PDFs change).
+    """
 
+    # ---- STEP 1: LOAD -------------------------------------------------
     print("[1/4] Loading PDFs from", KNOWLEDGE_DIR)
     loader = PyPDFDirectoryLoader(KNOWLEDGE_DIR)
     documents = loader.load()
 
     if not documents:
-        raise ValueError("No PDFs found in ./knowledge")
+        raise ValueError("No PDFs found. Add some to ./knowledge")
 
     print(f"      Loaded {len(documents)} pages.")
 
-    print("[2/4] Chunking into 300-token pieces (overlap=50)")
-    splitter = TokenTextSplitter(chunk_size=300, chunk_overlap=50)
+    # ---- STEP 2: CHUNK ------------------------------------------------
+    # TokenTextSplitter splits by tokens (not characters), which matches
+    # how the LLM actually sees text. Overlap prevents a sentence from
+    # being cut in half between two chunks.
+    print(f"[2/4] Chunking into {CHUNK_SIZE}-token pieces "
+          f"(overlap={CHUNK_OVERLAP})")
+    splitter = TokenTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
     chunks = splitter.split_documents(documents)
     print(f"      Created {len(chunks)} chunks.")
 
-    print(f"[3/4] Embedding with {EMBEDDING_MODEL}")
+    # ---- STEP 3: EMBED ------------------------------------------------
+    # The embedding model converts text → 384 numbers (a vector).
+    # Similar meanings produce similar vectors.
+    print(f"[3/4] Embedding with {EMBEDDING_MODEL} "
+          f"(first run downloads ~80 MB)")
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
-    print(f"[4/4] Uploading to Pinecone index '{PINECONE_INDEX_NAME}'")
-    get_or_create_pinecone_index()  # Ensure the index exists
-    vectorstore = PineconeVectorStore.from_documents(
+    # ---- STEP 4: STORE ------------------------------------------------
+    # ChromaDB writes the vectors + original text to ./chroma_db
+    print(f"[4/4] Storing in ChromaDB at {CHROMA_DIR}")
+    vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        index_name=PINECONE_INDEX_NAME,
+        persist_directory=CHROMA_DIR,
     )
-    print("      Done. Vector store built.")
+    print("      Done. Vector store built.\n")
     return vectorstore
 
 
 def load_vectorstore():
-    """Load an existing Pinecone index (fast, no re-embedding)."""
+    """Load an already-built ChromaDB from disk (fast, no re-embedding)."""
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    return PineconeVectorStore(
-        index_name=PINECONE_INDEX_NAME,
-        embedding=embeddings,
+    return Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
     )
 
 
-# ── STRICT PROMPT ───────────────────────────────────────
+def vectorstore_exists() -> bool:
+    """Check if ./chroma_db already exists and has data."""
+    return os.path.isdir(CHROMA_DIR) and len(os.listdir(CHROMA_DIR)) > 0
+
+
+# ===============================================================
+# STEPS 5-8: EMBED QUERY → SEARCH → PROMPT → LLM
+# ===============================================================
+
+# ---- STEP 7: THE STRICT PROMPT ------------------------------------
+# This is the most important part of RAG. It forces the LLM to answer
+# ONLY from the retrieved context. Without this, the LLM would make
+# things up (hallucinate) using its training data.
 PROMPT_TEMPLATE = """You are an AI customer support assistant for our company.
-Answer the user's question using ONLY the company information provided below.
-If the answer is not in the provided context, politely say:
-"I do not know based on the provided documents."
+Answer the user's question using the company information provided below.
+
 
 Context:
 {context}
@@ -151,15 +123,27 @@ Question: {question}
 Answer:"""
 
 
-# ── QUERY ───────────────────────────────────────────────
 def answer_question(question: str, vectorstore) -> dict:
-    """Retrieve top 4 chunks, build prompt, call Groq LLM."""
-    docs = vectorstore.similarity_search(question, k=4)
+    """
+    Runs steps 5-8 for a single question.
+    Returns a dict with the answer and the source chunks (for transparency).
+    """
+
+    # ---- STEP 5 + 6: EMBED QUERY + SEARCH -----------------------------
+    # The question is embedded with the SAME model, then Chroma finds
+    # the TOP_K chunks whose vectors are closest (cosine similarity).
+    docs = vectorstore.similarity_search(question, k=TOP_K)
+
+    # Join the retrieved chunks into one block of context text.
+    # The separator makes it obvious where one chunk ends and another begins.
     context = "\n\n---\n\n".join(doc.page_content for doc in docs)
 
+    # ---- STEP 7: BUILD THE PROMPT -------------------------------------
     prompt = PromptTemplate.from_template(PROMPT_TEMPLATE)
     formatted_prompt = prompt.format(context=context, question=question)
 
+    # ---- STEP 8: SEND TO GROQ -----------------------------------------
+    # temperature=0 makes the model deterministic (no creative drift).
     llm = ChatGroq(model_name=LLM_MODEL, temperature=0)
     response = llm.invoke(formatted_prompt)
 
